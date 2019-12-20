@@ -1,0 +1,138 @@
+#!/usr/bin/python
+import time, json, os, argparse, signal, sys
+from subprocess import check_output, STDOUT
+
+from blessings import Terminal
+import hurry.filesize
+
+default_timedelta = 0.2
+commands = [ 'df', 'iostat', 'pools', 'osds' ]
+verbose = False
+
+def signal_handler(sig, frame):
+    print " Done, exiting..."
+    sys.exit(0)
+
+def bytesize(size):
+    if not verbose:
+        return hurry.filesize.size(size, system=hurry.filesize.iec) + 'B'
+    else:
+        return str(size) + 'B'
+
+def parse():
+    parser = argparse.ArgumentParser(description=
+                        "continuously print the monitoring command to the screen")
+    parser.add_argument('cmd', type=str,
+                        help="the monitoring command",
+                        choices=commands)
+    parser.add_argument('-t', '--time', type=float,
+                        nargs='?',
+                        const=default_timedelta,
+                        help="""the monitoring time resolution, default is
+                            {}s""".format(default_timedelta),
+                        default=default_timedelta)
+    parser.add_argument('-v', '--verbose',
+                        help="""be very verbose about bytecount""",
+                        action='store_true')
+    args = parser.parse_args()
+    global verbose
+    verbose = args.verbose
+    return (args.cmd, args.time)
+
+def pg_dump_reserves(cmd):
+    output = ''
+    command = './bin/ceph pg dump {} --format=json'.format(cmd)
+    objs = json.loads(check_output(command.split(), stderr=open(os.devnull, 'wb')))
+    id_field = 'poolid' if cmd == commands[2] else 'osd'
+    stats_field = 'store_stats' if cmd == commands[2] else 'statfs'
+    for obj in sorted(objs, key=lambda o: o[id_field]):
+        objid = obj[id_field]
+        stats = obj[stats_field]
+        reserved = stats['reserved']
+        used_reserved = stats['used_reserved']
+        output += ('{} ('
+                + str(objid)
+                + '): reserved = '
+                + bytesize(reserved)
+                + ', used_reserved = '
+                + bytesize(used_reserved)
+                + '\n').format(cmd[0:-1])
+    return output
+
+def iostat():
+    output = check_output('iostat', stderr=open(os.devnull, 'wb'))
+    return output
+
+def df():
+    output = ''
+    command = './bin/ceph df detail --format=json'
+    report = json.loads(check_output(command.split(), stderr=open(os.devnull, 'wb')))
+    
+    def df_overall(obj=report['stats']):
+        output = 'OVERALL'
+        output += ': total bytes: ' + bytesize(obj['total_bytes'])
+        output += ', total avail: ' + bytesize(obj['total_avail_bytes'])
+        output += ', total used: ' + bytesize(obj['total_used_bytes'])
+        percentage = 100 * obj['total_used_bytes']/obj['total_bytes']
+        output += ', used percentage: ' + str(percentage) + '%'
+        output += ', total objects: ' + str(obj['total_objects'])
+        output += '\n'
+        return output
+    
+    def df_pool(pool):
+        stats = pool['stats']
+        output = 'Pool ' + str(pool['id'])
+        output += ': name: ' + pool['name'] + '\n'
+
+        output += '     [ normalized / raw ] stored: '
+        output += ' [ ' + bytesize(stats['stored'])
+        output += ' / ' + bytesize(stats['stored_raw']) + ' ]'
+        output += ', used bytes: ' + bytesize(stats['bytes_used'])
+        output += ', used percentage: ' + str(stats['percent_used']*100) + '%'
+        output += '\n'
+        if stats['advertised_reserved'] != 0:
+            output += '     [ advertised / actual / used ] reserved space:'
+            output += ' [ ' + bytesize(stats['advertised_reserved'])
+            output += ' / ' + bytesize(stats['actual_reserved'])
+            output += ' / ' + bytesize(stats['used_reserved']) + ' ]'
+            percentage = 100 * stats['used_reserved']/stats['actual_reserved']
+            output += ', used reserved percentage: ' + str(percentage) + '%'
+            output += '\n'
+        return output
+
+    output += df_overall()
+    output += '\n'
+    pools = report['pools']
+    for pool in sorted(pools, key=lambda p : p['id']):
+        output += df_pool(pool)
+    return output
+
+def handle_command(cmd):
+    if cmd == commands[0]:
+        return df()
+    elif cmd == commands[1]:
+        return iostat()
+    elif cmd == commands[2]:
+        return pg_dump_reserves(cmd)
+    elif cmd == commands[3]:
+        return pg_dump_reserves(cmd)
+    else:
+        return "\n"
+
+def watch(command, timedelta):
+    print """\n#######################################\n"""
+    signal.signal(signal.SIGINT, signal_handler)
+    t = Terminal()
+    output = ''
+    while 1:
+        h = len(output.splitlines())
+        output = handle_command(command)
+        print t.move(t.height-1-h-(0 if h == 0 else 1)) + output
+        time.sleep(timedelta)
+
+def main():
+    cmd, timedelta = parse()
+    watch(cmd, timedelta)
+
+if __name__ == '__main__':
+    main()
